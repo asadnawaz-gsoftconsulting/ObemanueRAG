@@ -31,7 +31,9 @@ def fetch_all_menu_items(collection):
     """
     Retrieve all menu items from the collection.
     """
+    
     try:
+        
         menu_items = list(collection.find(
             {"embedding": {"$exists": False}},  # Only fetch items without embeddings
             {
@@ -152,7 +154,7 @@ def generate_all_embeddings(collection, embeddings_model):
     
     print(f"Embedding generation complete. {processed} new items processed.")
 
-def search_similar_items(collection, query, embeddings_model, limit=10, score_threshold=0.5):
+def search_similar_items(collection, query, embeddings_model, menu_id, venue_id, limit=10, score_threshold=0.5):
     """
     Search for similar menu items using vector similarity search with venue and menu filtering.
     """
@@ -167,6 +169,12 @@ def search_similar_items(collection, query, embeddings_model, limit=10, score_th
                     "queryVector": query_embedding,
                     "numCandidates": 500,
                     "limit": 10
+                }
+            },
+            {
+                "$match": {
+                    "menus._id": ObjectId(menu_id),
+                    "venue._id": ObjectId(venue_id)
                 }
             },
             {
@@ -215,6 +223,11 @@ def search_similar_items(collection, query, embeddings_model, limit=10, score_th
         ])
         
         results = list(similar_items)
+        
+        # If no results found, return empty array immediately
+        if not results:
+            return []
+        
         processed_results = []
         query_terms = set(query.lower().split())
         
@@ -231,8 +244,12 @@ def search_similar_items(collection, query, embeddings_model, limit=10, score_th
                     customization_terms.update(str(price.get('description', '')).lower().split())
             
             term_matches = len(query_terms & (name_terms | category_terms | tags | customization_terms))
-            relevancy_boost = term_matches * 0.1
             
+            # If no term matches found, skip this item
+            if term_matches == 0:
+                continue
+                
+            relevancy_boost = term_matches * 0.1
             final_score = item['score'] + relevancy_boost
             
             processed_results.append({
@@ -246,6 +263,10 @@ def search_similar_items(collection, query, embeddings_model, limit=10, score_th
                 'score': final_score
             })
         
+        # If no relevant results after processing, return empty array
+        if not processed_results:
+            return []
+            
         processed_results.sort(key=lambda x: x['score'], reverse=True)
         return processed_results[:limit]
         
@@ -257,58 +278,78 @@ from openai import OpenAI
 
 def generate_natural_response(query, similar_items):
     """
-    Generate a natural language response using GPT-4 based on the user's query and search results.
+    Generate a response matching the MongoDB data structure.
     """
     try:
-        client = OpenAI(api_key=api_key)
+        formatted_items = []
         
-        items_text = ""
-        for idx, item in enumerate(similar_items, 1):
-            items_text += f"\nItem {idx}:\n"
-            items_text += f"Name: {item['name']}\n"
-            items_text += f"Category: {item['category']}\n"
-            items_text += f"Base Price: ${item.get('price', 'N/A')}\n"
+        for item in similar_items:
+            formatted_item = {
+                "_id": item.get('_id'),
+                "itemId": item.get('itemId'),
+                "name": {
+                    "en": item['name'],
+                    "de": "",
+                    "nl": ""
+                },
+                "description": {
+                    "en": item.get('description', ''),
+                    "de": "",
+                    "nl": ""
+                },
+                "categories": {
+                    "name": {
+                        "en": item.get('category', ''),
+                        "de": "",
+                        "nl": ""
+                    }
+                },
+                "prices": [{
+                    "description": {
+                        "en": item['name'],
+                        "de": "",
+                        "nl": ""
+                    },
+                    "variants": [{
+                        "price": item.get('price'),
+                        "isDefault": True
+                    }]
+                }],
+                "customizations": [{
+                    "name": {
+                        "en": custom.get('name', '').split(' - ')[0],
+                        "de": "",
+                        "nl": ""
+                    },
+                    "prices": [{
+                        "description": {
+                            "en": custom.get('name', '').split(' - ')[1] if ' - ' in custom.get('name', '') else custom.get('name', ''),
+                            "de": "",
+                            "nl": ""
+                        },
+                        "variants": [{
+                            "price": custom.get('price'),
+                            "isDefault": True
+                        }]
+                    }]
+                } for custom in item.get('customizations', [])],
+                "status": "active",
+                "inStock": True,
+                "ingredients": [],
+                "tags": [],
+                "itemDetails": item.get('itemDetails', ''),
+                "imageUrl": "",
+                "isPlaceholderAdded": False,
+                "isCreatedInMaster": True
+            }
             
-            # Add customization details
-            if item.get('customizations'):
-                items_text += "Customizations:\n"
-                for custom in item['customizations']:
-                    items_text += f"- {custom['name']}:\n"
-                    for price in custom.get('prices', []):
-                        items_text += f"  * {price['description']}: ${price['price']}\n"
-            
-            if item.get('description'):
-                items_text += f"Description: {item['description']}\n"
-
-        system_message = """You are a concise menu assistant. Provide brief, direct responses:
-        - For price queries: Return item name, base price, and relevant customization prices
-        - For availability queries: List matching items with prices and customizations
-        - Keep responses under 3 sentences
-        - No greetings or pleasantries needed
-        If no items found, just say "Item not available." """
-
-        user_content = f"""User Query: "{query}"
-
-        Available Menu Items:
-        {items_text if similar_items else 'No matching items found.'}
-
-        Please provide a helpful response to the user's query based on these menu items."""
-
-        response = client.chat.completions.create(
-            model="gpt-4-turbo-preview",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_content}
-            ],
-            temperature=0.7
-        )
+            formatted_items.append(formatted_item)
         
-        return response.choices[0].message.content.strip()
+        return formatted_items
 
     except Exception as e:
-        print(f"Error generating natural response: {e}")
-        return "I apologize, but I'm having trouble generating a response at the moment."
-    
+        print(f"Error generating response: {e}")
+        return []
 
 # Create Flask app
 app = Flask(__name__)
@@ -327,38 +368,34 @@ def search_endpoint():
     try:
         data = request.get_json()
         query = data.get('query')
+        menu_id = data.get('menu_id')
+        venue_id = data.get('venue_id')
         
         if not query:
             return jsonify({'error': 'Query is required'}), 400
         
-        # Initialize MongoDB and embedding model
+        if not menu_id or not venue_id:
+            return jsonify({'error': 'Menu ID and Venue ID are required'}), 400
+        
         collection = initialize_db()
         embeddings_model = OpenAIEmbeddings(
             api_key=api_key,
             model="text-embedding-ada-002"
         )
         
-        # Search for similar items
         similar_items = search_similar_items(
             collection,
             query,
-            embeddings_model
+            embeddings_model,
+            menu_id,
+            venue_id
         )
         
-        # Generate natural language response
-        response_text = generate_natural_response(query, similar_items)
+        # Get formatted response
+        items_array = generate_natural_response(query, similar_items)
         return jsonify({
-            'response': response_text
+            'items': items_array
         })
-        # Use custom JSON encoder
-        return app.response_class(
-            response=json.dumps({
-                'items': similar_items,
-                'response': response_text
-            }, cls=JSONEncoder),
-            status=200,
-            mimetype='application/json'
-        )
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -396,6 +433,8 @@ if __name__ == "__main__":
                 collection,
                 query,
                 embeddings_model,
+                None,
+                None
             )
             response = generate_natural_response(query, similar_items)
             print("\nResponse:")
@@ -403,3 +442,16 @@ if __name__ == "__main__":
     else:
         # Run Flask app
         app.run(host='0.0.0.0', port=5000, debug=True)
+
+# Example query to check for documents with specific menu_id and venue_id
+
+
+# # Check if documents exist with the specified menu_id and venue_id
+# matching_items = list(collection.find({
+#     "menus._id": menu_id,
+#     "venue._id": venue_id
+# }))
+
+# print(f"Number of matching items: {len(matching_items)}")
+# for item in matching_items:
+#     print(f"Item Name: {item.get('name', {}).get('en', '')}")
